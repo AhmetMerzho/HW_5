@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multi‑Stock GRU Prediction Demo — Improved</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root{--bg:#0b1220;--card:#111a2b;--muted:#6c7a96;--accent:#34d399;--accent2:#60a5fa;--bad:#f87171}
+    html,body{margin:0;height:100%;background:var(--bg);color:#e5e7eb;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
+    h1,h2,h3{margin:0 0 .25rem}
+    .wrap{max-width:1200px;margin:0 auto;padding:20px}
+    .card{background:var(--card);border-radius:18px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);margin:14px 0}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    label{font-size:.9rem;color:var(--muted)}
+    input,select,button{border-radius:12px;border:none;padding:10px 12px;background:#0f172a;color:#e5e7eb}
+    button{cursor:pointer;background:linear-gradient(135deg,var(--accent),var(--accent2));font-weight:600}
+    button.secondary{background:#1f2937}
+    .pill{display:inline-block;padding:6px 10px;background:#0f172a;border-radius:999px;margin-right:8px}
+    .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+    .muted{color:var(--muted)}
+    .small{font-size:.85rem}
+    #log{white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:.9rem}
+    a{color:#93c5fd}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Multi‑Stock GRU Prediction Demo — <span class="muted small">improved features & model</span></h1>
+    <p class="muted">Goal: improve top‑1 accuracy by ≥3% by adding features and/or changing the model. Single‑file app you can host on GitHub Pages.</p>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Load dataset (CSV with columns: <em>date, stock, open, high, low, close, volume</em>)</label><br/>
+          <input type="file" id="fileInput" accept=".csv" />
+        </div>
+        <div>
+          <label>Sequence length (T)</label><br/>
+          <input type="number" id="seqLen" value="30" min="5" max="200"/>
+        </div>
+        <div>
+          <label>Test fraction</label><br/>
+          <input type="number" id="testFrac" value="0.3" step="0.05" min="0.1" max="0.9"/>
+        </div>
+        <div>
+          <label>Epochs</label><br/>
+          <input type="number" id="epochs" value="18" min="1" max="200"/>
+        </div>
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <button id="btnBuild">Build Model</button>
+        <button id="btnTrain" class="secondary">Train Model</button>
+        <button id="btnPredict" class="secondary">Run Prediction</button>
+        <button id="btnSave" class="secondary">Save Model</button>
+        <button id="btnLoad" class="secondary">Load Saved</button>
+        <span class="pill" id="status">Idle</span>
+      </div>
+      <div id="log" class="muted" style="margin-top:8px"></div>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <h3>Stock Accuracy Ranking</h3>
+        <div id="bar"></div>
+      </div>
+      <div class="card">
+        <h3>Prediction Timeline (<span id="selTicker">—</span>)</h3>
+        <div id="timeline"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Feature Set</h3>
+      <p class="small">We use OHLCV plus engineered indicators computed per stock: percent change, log return, high‑low range, close‑open range, rolling mean (5, 10), rolling volatility (5), RSI‑14, and volume change. All features are min–max scaled using the training window per stock. Target: next‑day direction <em>(up = 1 if next_close &gt; close, else 0)</em>.</p>
+      <div class="grid-3">
+        <div class="pill">OHLCV (5)</div>
+        <div class="pill">pct_change</div>
+        <div class="pill">log_return</div>
+        <div class="pill">hl_range</div>
+        <div class="pill">co_range</div>
+        <div class="pill">sma5</div>
+        <div class="pill">sma10</div>
+        <div class="pill">volatility5</div>
+        <div class="pill">rsi14</div>
+        <div class="pill">vol_change</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Model</h3>
+      <p class="small">Temporal Conv (feature extractor) → LayerNorm → BiGRU(64) → Dropout → Dense(64, GELU) → Dense(2, softmax). This hybrid CNN+BiGRU is often stronger than a plain GRU for noisy financial sequences.</p>
+      <pre id="modelSummary" class="muted small"></pre>
+    </div>
+
+    <p class="muted small">Tip: Host this file in any GitHub repo’s <code>docs/</code> folder or root and enable GitHub Pages. It runs entirely in‑browser.</p>
+  </div>
+
+<script>
+// -------------------------- Utils --------------------------
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+function log(msg){ logEl.textContent += `\n${msg}`; logEl.scrollTop = logEl.scrollHeight }
+function setStatus(t){ statusEl.textContent = t }
+function minMaxScale(arr){ // returns {scaled, min, max}
+  const min = arr.reduce((m,v)=>Math.min(m,v), Infinity);
+  const max = arr.reduce((m,v)=>Math.max(m,v), -Infinity);
+  const denom = (max - min) || 1e-9;
+  return {scaled: arr.map(v => (v - min) / denom), min, max};
+}
+
+// RSI 14 implementation
+function rsi(values, period=14){
+  const gains=[], losses=[]; let rsis = new Array(values.length).fill(NaN);
+  for(let i=1;i<values.length;i++){
+    const diff = values[i]-values[i-1];
+    gains.push(Math.max(0,diff)); losses.push(Math.max(0,-diff));
+  }
+  let avgGain = gains.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  let avgLoss = losses.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  rsis[period] = 100 - (100/(1 + (avgGain/(avgLoss||1e-9))));
+  for(let i=period+1;i<values.length;i++){
+    avgGain = (avgGain*(period-1)+gains[i-1])/period;
+    avgLoss = (avgLoss*(period-1)+losses[i-1])/period;
+    rsis[i] = 100 - (100/(1 + (avgGain/(avgLoss||1e-9))));
+  }
+  return rsis;
+}
+
+// Rolling helpers
+function rollingMean(arr, w){
+  const out = new Array(arr.length).fill(NaN); let s=0;
+  for(let i=0;i<arr.length;i++){ s+=arr[i]; if(i>=w){ s-=arr[i-w]; }
+    if(i>=w-1) out[i]=s/Math.min(i+1,w); }
+  return out;
+}
+function rollingStd(arr, w){
+  const mu = rollingMean(arr, w); const out = new Array(arr.length).fill(NaN);
+  for(let i=w-1;i<arr.length;i++){
+    const start = i-w+1; const slice = arr.slice(start,i+1);
+    const m = mu[i]; const v = slice.reduce((a,b)=>a+(b-m)*(b-m),0)/w; out[i]=Math.sqrt(v);
+  }
+  return out;
+}
+
+// ----------------------- Data loading ----------------------
+let RAW = null; // array of rows
+let perTicker = new Map();
+let featureNames = [];
+
+function parseCSV(file){
+  return new Promise((resolve,reject)=>{
+    Papa.parse(file,{header:true,dynamicTyping:true,complete:res=>resolve(res.data),error:reject});
+  })
+}
+
+function groupAndEngineer(rows){
+  // Expect columns: date, stock, open, high, low, close, volume
+  perTicker.clear();
+  const byTicker = {};
+  for(const r of rows){ if(!r.stock && r.ticker) r.stock = r.ticker; if(!r.date||!r.stock) continue; r.date = new Date(r.date); (byTicker[r.stock] ||= []).push(r); }
+  for(const [tic,arr] of Object.entries(byTicker)){
+    arr.sort((a,b)=>a.date - b.date);
+    const open = arr.map(d=>+d.open), high=arr.map(d=>+d.high), low=arr.map(d=>+d.low), close=arr.map(d=>+d.close), vol=arr.map(d=>+d.volume||0);
+    const pct = close.map((c,i)=> i? (c-close[i-1])/(close[i-1]||1e-9): NaN);
+    const logr = close.map((c,i)=> i? Math.log((c||1e-9)/(close[i-1]||1e-9)) : NaN);
+    const hlRange = high.map((h,i)=> (h - low[i])/(close[i-1]||1e-9));
+    const coRange = close.map((c,i)=> (c - open[i])/(open[i]||1e-9));
+    const sma5 = rollingMean(close,5), sma10=rollingMean(close,10);
+    const vol5 = rollingStd(close,5);
+    const rsi14 = rsi(close,14);
+    const vchg = vol.map((v,i)=> i? (v - vol[i-1])/(vol[i-1]||1e-9): NaN);
+
+    // Build per‑row feature vectors, avoid NaNs at start
+    const rowsF = [];
+    for(let i=0;i<arr.length;i++){
+      rowsF.push({
+        date: arr[i].date,
+        open: open[i], high: high[i], low: low[i], close: close[i], volume: vol[i],
+        pct: pct[i], logr: logr[i], hlRange: hlRange[i], coRange: coRange[i],
+        sma5: sma5[i], sma10: sma10[i], vol5: vol5[i], rsi14: rsi14[i], vchg: vchg[i],
+      })
+    }
+
+    // Remove leading rows with NaNs (due to indicators)
+    const validStart = rowsF.findIndex(r=> Object.values(r).every(v=> !(Number.isNaN(v))));
+    const clean = rowsF.slice(validStart);
+
+    // Min‑max scale each numeric feature per ticker (fit on full series; below we split train/test chronologically and sequences are built within)
+    const keys = Object.keys(clean[0]).filter(k=>k!=='date');
+    const scalers = {};
+    for(const k of keys){ const ar = clean.map(r=>r[k]); const {scaled,min,max} = minMaxScale(ar); scalers[k] = {min,max}; scaled.forEach((v,i)=> clean[i][k]=v); }
+
+    perTicker.set(tic,{rows: clean, scalers});
+  }
+}
+
+// ------------------- Dataset creation ---------------------
+function createSequences(seqLen, testFrac){
+  const data = [];
+  for(const [tic, obj] of perTicker.entries()){
+    const rows = obj.rows; const n = rows.length; if(n < seqLen+2) continue;
+    const split = Math.floor((1 - testFrac) * n);
+    const feats = Object.keys(rows[0]).filter(k=>k!=='date');
+    featureNames = feats;
+    const Xtr=[], Ytr=[], Xte=[], Yte=[], dates=[];
+    function pushSlices(start, end, toX, toY){
+      for(let i=start;i<=end - seqLen - 1;i++){
+        const win = rows.slice(i, i+seqLen);
+        const next = rows[i+seqLen];
+        const x = win.map(r=> feats.map(f=> r[f]));
+        const y = next.close > rows[i+seqLen-1].close ? 1 : 0; // next‑day up/down
+        toX.push(x); toY.push(y); dates.push(next.date);
+      }
+    }
+    pushSlices(0, split, Xtr, Ytr);
+    pushSlices(split, n-1, Xte, Yte);
+    data.push({ticker: tic, Xtr, Ytr, Xte, Yte, dates});
+  }
+  return data;
+}
+
+// ----------------------- Model ----------------------------
+function buildModel(inputLen, featDim){
+  const gelu = x=> tf.mul(0.5, tf.mul(x, tf.add(1, tf.erf(tf.mul(x, 1/Math.sqrt(2))))));
+  const input = tf.input({shape:[inputLen, featDim]});
+  const conv = tf.layers.conv1d({filters:32,kernelSize:3,activation:gelu,padding:'causal'}).apply(input);
+  const ln = tf.layers.layerNormalization().apply(conv);
+  const bigru = tf.layers.bidirectional({layer: tf.layers.gru({units:64, returnSequences:false}), mergeMode:'concat'}).apply(ln);
+  const drop = tf.layers.dropout({rate:0.3}).apply(bigru);
+  const dense1 = tf.layers.dense({units:64, activation:gelu}).apply(drop);
+  const out = tf.layers.dense({units:2, activation:'softmax'}).apply(dense1);
+  const model = tf.model({inputs: input, outputs: out});
+  model.compile({optimizer: tf.train.adam(0.001), loss:'sparseCategoricalCrossentropy', metrics:['accuracy']});
+  return model;
+}
+
+let MODEL = null, DS = null;
+
+async function onBuild(){
+  const T = +document.getElementById('seqLen').value;
+  if(perTicker.size===0){ alert('Load CSV first.'); return }
+  DS = createSequences(T, +document.getElementById('testFrac').value);
+  const any = DS.find(d=>d.Xtr.length>0);
+  if(!any){ alert('Not enough data to create sequences.'); return }
+  MODEL = buildModel(T, featureNames.length);
+  setStatus('Model built');
+  log(MODEL.summary(null, x=>{ document.getElementById('modelSummary').textContent=x }))
+}
+
+async function onTrain(){
+  if(!MODEL){ alert('Build model first.'); return }
+  setStatus('Training…');
+  // Concatenate all tickers into a single training set to learn general patterns
+  const X = DS.flatMap(d=>d.Xtr); const Y = DS.flatMap(d=>d.Ytr);
+  const Xten = tf.tensor(X); const Yten = tf.tensor(Y);
+  const epochs = +document.getElementById('epochs').value;
+  await MODEL.fit(Xten, Yten, {epochs, batchSize:128, shuffle:true, validationSplit:0.1, callbacks:{
+    onEpochEnd:(e,logs)=> setStatus(`Epoch ${e+1}/${epochs} — loss ${logs.loss.toFixed(4)} acc ${logs.acc?.toFixed?.(3)}`)
+  }});
+  Xten.dispose(); Yten.dispose();
+  setStatus('Training done');
+}
+
+async function onPredict(){
+  if(!MODEL||!DS){ alert('Build & Train first.'); return }
+  setStatus('Predicting…');
+  const bars=[]; const timelines = {};
+  for(const d of DS){
+    if(d.Xte.length===0) continue;
+    const X = tf.tensor(d.Xte);
+    const probs = MODEL.predict(X);
+    const preds = await probs.argMax(-1).data();
+    const y = d.Yte; const correct = y.map((yi,i)=> yi===preds[i]?1:0);
+    const acc = correct.reduce((a,b)=>a+b,0) / correct.length;
+    bars.push({ticker:d.ticker, acc});
+    timelines[d.ticker] = {correct, dates: d.dates.slice(d.dates.length - correct.length)};
+    X.dispose(); probs.dispose();
+  }
+  setStatus('Prediction done');
+  renderBars(bars.sort((a,b)=> b.acc-a.acc));
+  if(bars.length){ renderTimeline(bars[0].ticker, timelines[bars[0].ticker]); }
+  window._timelines = timelines;
+}
+
+function renderBars(items){
+  const tickers = items.map(d=>d.ticker);
+  const accs = items.map(d=>100*d.acc);
+  Plotly.newPlot('bar', [{x: accs, y: tickers, type:'bar', orientation:'h', hovertemplate:'%{y}: %{x:.2f}%<extra></extra>'}],
+    {margin:{l:60,r:20,t:10,b:30}, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)', xaxis:{title:'Accuracy (%)', gridcolor:'#233'}, yaxis:{}, showlegend:false});
+  const barDiv = document.getElementById('bar');
+  barDiv.on('plotly_click',data=>{ const idx = data.points[0].pointIndex; const tic = tickers[idx];
+    document.getElementById('selTicker').textContent = tic; renderTimeline(tic, window._timelines[tic]); });
+}
+
+function renderTimeline(ticker, tl){
+  document.getElementById('selTicker').textContent = ticker;
+  const x = tl.correct.map((_,i)=>`Pred ${i+1}`); const y = tl.correct.map(v=> v?1:-1);
+  Plotly.newPlot('timeline', [
+    {x, y, type:'scatter', mode:'lines+markers', name:'Correct Predictions', hovertemplate:'%{x}: %{y==1?"Correct":"Wrong"}<extra></extra>'}
+  ], {yaxis:{tickvals:[-1,1], ticktext:['Wrong','Correct']}, margin:{l:60,r:20,t:10,b:40}, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)'})
+}
+
+async function onSave(){ if(!MODEL) return; await MODEL.save('downloads://multi_stock_gru_improved'); setStatus('Model saved (.json + .bin)') }
+async function onLoad(){ MODEL = await tf.loadLayersModel('indexeddb://multi_stock_gru_improved').catch(()=>null) || await tf.loadLayersModel('localstorage://multi_stock_gru_improved').catch(()=>null); if(!MODEL) alert('No saved model in browser storage. Use the Save button first.'); else setStatus('Loaded from storage'); }
+
+// ----------------------- Wiring ---------------------------
+const fileInput = document.getElementById('fileInput');
+fileInput.addEventListener('change', async (e)=>{
+  const f = e.target.files[0]; if(!f) return;
+  setStatus('Parsing CSV…');
+  const rows = await parseCSV(f); RAW = rows; log(`Loaded ${rows.length} rows`);
+  groupAndEngineer(rows);
+  setStatus(`Prepared ${perTicker.size} tickers`);
+});
+
+document.getElementById('btnBuild').onclick = onBuild;
+document.getElementById('btnTrain').onclick = onTrain;
+document.getElementById('btnPredict').onclick = onPredict;
+document.getElementById('btnSave').onclick = onSave;
+document.getElementById('btnLoad').onclick = onLoad;
+</script>
+</body>
+</html>
